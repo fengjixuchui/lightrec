@@ -87,21 +87,16 @@ static void lightrec_emit_end_of_block(struct lightrec_cstate *state,
 	lightrec_jump_to_eob(state, _jit);
 }
 
-void lightrec_emit_eob(struct lightrec_cstate *state, const struct block *block,
-		       u16 offset, bool after_op)
+void lightrec_emit_eob(struct lightrec_cstate *state,
+		       const struct block *block, u16 offset)
 {
 	struct regcache *reg_cache = state->reg_cache;
 	jit_state_t *_jit = block->_jit;
-	union code c = block->opcode_list[offset].c;
-	u32 cycles = state->cycles;
-
-	if (after_op)
-		cycles += lightrec_cycles_of_opcode(c);
 
 	lightrec_clean_regs(reg_cache, _jit);
 
 	jit_movi(JIT_V0, block->pc + (offset << 2));
-	jit_subi(LIGHTREC_REG_CYCLE, LIGHTREC_REG_CYCLE, cycles);
+	jit_subi(LIGHTREC_REG_CYCLE, LIGHTREC_REG_CYCLE, state->cycles);
 
 	lightrec_jump_to_eob(state, _jit);
 }
@@ -250,7 +245,7 @@ static void rec_b(struct lightrec_cstate *state, const struct block *block, u16 
 
 	if (op_flag_local_branch(op->flags)) {
 		/* Recompile the delay slot */
-		if (next && next->opcode && !op_flag_no_ds(op->flags))
+		if (!op_flag_no_ds(op->flags) && next->opcode)
 			lightrec_rec_opcode(state, block, offset + 1);
 
 		if (link) {
@@ -1127,6 +1122,13 @@ static u32 rec_ram_mask(struct lightrec_state *state)
 	return (RAM_SIZE << (state->mirrors_mapped * 2)) - 1;
 }
 
+static u32 rec_io_mask(const struct lightrec_state *state)
+{
+	u32 length = state->maps[PSX_MAP_HW_REGISTERS].length;
+
+	return GENMASK(31 - clz32(length - 1), 0);
+}
+
 static void rec_store_memory(struct lightrec_cstate *cstate,
 			     const struct block *block,
 			     u16 offset, jit_code_t code,
@@ -1258,7 +1260,7 @@ static void rec_store_io(struct lightrec_cstate *cstate,
 
 	return rec_store_memory(cstate, block, offset, code, swap_code,
 				cstate->state->offset_io,
-				0x1fffffff, false);
+				rec_io_mask(cstate->state), false);
 }
 
 static void rec_store_direct_no_invalidate(struct lightrec_cstate *cstate,
@@ -1582,7 +1584,7 @@ static void rec_load_io(struct lightrec_cstate *cstate,
 	_jit_note(block->_jit, __FILE__, __LINE__);
 
 	rec_load_memory(cstate, block, offset, code, swap_code, is_unsigned,
-			cstate->state->offset_io, 0x1fffffff);
+			cstate->state->offset_io, rec_io_mask(cstate->state));
 }
 
 static void rec_load_direct(struct lightrec_cstate *cstate,
@@ -1883,6 +1885,7 @@ rec_mtc0(struct lightrec_cstate *state, const struct block *block, u16 offset)
 	const union code c = block->opcode_list[offset].c;
 	jit_state_t *_jit = block->_jit;
 	u8 rt, tmp = 0, tmp2, status;
+	jit_node_t *to_end;
 
 	jit_note(__FILE__, __LINE__);
 
@@ -1955,19 +1958,29 @@ rec_mtc0(struct lightrec_cstate *state, const struct block *block, u16 offset)
 		jit_orr(tmp, tmp, tmp2);
 	}
 
-	if (c.r.rd == 12 || c.r.rd == 13) {
-		jit_stxi_i(offsetof(struct lightrec_state, exit_flags),
-			   LIGHTREC_REG_STATE, tmp);
-
-		lightrec_free_reg(reg_cache, tmp);
-		lightrec_free_reg(reg_cache, tmp2);
-	}
-
 	lightrec_free_reg(reg_cache, rt);
 
+	if (c.r.rd == 12 || c.r.rd == 13) {
+		to_end = jit_beqi(tmp, 0);
+
+		jit_ldxi_i(tmp2, LIGHTREC_REG_STATE,
+			   offsetof(struct lightrec_state, target_cycle));
+		jit_subr(tmp2, tmp2, LIGHTREC_REG_CYCLE);
+		jit_movi(LIGHTREC_REG_CYCLE, 0);
+		jit_stxi_i(offsetof(struct lightrec_state, target_cycle),
+			   LIGHTREC_REG_STATE, tmp2);
+		jit_stxi_i(offsetof(struct lightrec_state, current_cycle),
+			   LIGHTREC_REG_STATE, tmp2);
+
+
+		jit_patch(to_end);
+	}
+
 	if (!op_flag_no_ds(block->opcode_list[offset].flags) &&
-	    (c.r.rd == 12 || c.r.rd == 13))
-		lightrec_emit_eob(state, block, offset + 1, true);
+	    (c.r.rd == 12 || c.r.rd == 13)) {
+		state->cycles += lightrec_cycles_of_opcode(c);
+		lightrec_emit_eob(state, block, offset + 1);
+	}
 }
 
 static void rec_cp0_MFC0(struct lightrec_cstate *state,
@@ -2124,7 +2137,7 @@ static void rec_cp2_basic_CFC2(struct lightrec_cstate *state,
 		break;
 	default:
 		rt = lightrec_alloc_reg_out(reg_cache, _jit, c.r.rt, REG_ZEXT);
-		jit_ldxi_i(rt, LIGHTREC_REG_STATE, cp2c_i_offset(c.r.rd));
+		jit_ldxi_ui(rt, LIGHTREC_REG_STATE, cp2c_i_offset(c.r.rd));
 		break;
 	}
 
@@ -2386,6 +2399,7 @@ static void rec_meta_MULT2(struct lightrec_cstate *state,
 	u32 flags = block->opcode_list[offset].flags;
 	bool is_signed = c.i.op == OP_META_MULT2;
 	u8 rs, lo, hi, rflags = 0, hiflags = 0;
+	unsigned int i;
 
 	if (!op_flag_no_hi(flags) && c.r.op < 32) {
 		rflags = is_signed ? REG_EXT : REG_ZEXT;
@@ -2397,28 +2411,38 @@ static void rec_meta_MULT2(struct lightrec_cstate *state,
 
 	rs = lightrec_alloc_reg_in(reg_cache, _jit, c.i.rs, rflags);
 
-	if (!op_flag_no_lo(flags)) {
-		lo = lightrec_alloc_reg_out(reg_cache, _jit, reg_lo, 0);
+	/*
+	 * We must handle the case where one of the output registers is our rs
+	 * input register. Thanksfully, computing LO/HI can be done in any
+	 * order. Here, we make sure that the computation that overwrites the
+	 * input register is always performed last.
+	 */
+	for (i = 0; i < 2; i++) {
+		if ((!i ^ (reg_lo == c.i.rs)) && !op_flag_no_lo(flags)) {
+			lo = lightrec_alloc_reg_out(reg_cache, _jit, reg_lo, 0);
 
-		if (c.r.op < 32)
-			jit_lshi(lo, rs, c.r.op);
-		else
-			jit_movi(lo, 0);
+			if (c.r.op < 32)
+				jit_lshi(lo, rs, c.r.op);
+			else
+				jit_movi(lo, 0);
 
-		lightrec_free_reg(reg_cache, lo);
-	}
+			lightrec_free_reg(reg_cache, lo);
+			continue;
+		}
 
-	if (!op_flag_no_hi(flags)) {
-		hi = lightrec_alloc_reg_out(reg_cache, _jit, reg_hi, hiflags);
+		if ((!!i ^ (reg_lo == c.i.rs)) && !op_flag_no_hi(flags)) {
+			hi = lightrec_alloc_reg_out(reg_cache, _jit,
+						    reg_hi, hiflags);
 
-		if (c.r.op >= 32)
-			jit_lshi(hi, rs, c.r.op - 32);
-		else if (is_signed)
-			jit_rshi(hi, rs, 32 - c.r.op);
-		else
-			jit_rshi_u(hi, rs, 32 - c.r.op);
+			if (c.r.op >= 32)
+				jit_lshi(hi, rs, c.r.op - 32);
+			else if (is_signed)
+				jit_rshi(hi, rs, 32 - c.r.op);
+			else
+				jit_rshi_u(hi, rs, 32 - c.r.op);
 
-		lightrec_free_reg(reg_cache, hi);
+			lightrec_free_reg(reg_cache, hi);
+		}
 	}
 
 	lightrec_free_reg(reg_cache, rs);
