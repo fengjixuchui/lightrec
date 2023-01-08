@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.0)
-project(lightrec LANGUAGES C VERSION 0.5)
+project(lightrec LANGUAGES C VERSION 0.6)
 
 set(BUILD_SHARED_LIBS ON CACHE BOOL "Build shared libraries")
 if (NOT BUILD_SHARED_LIBS)
@@ -29,6 +29,7 @@ set(HAS_DEFAULT_ELM ${CMAKE_COMPILER_IS_GNUCC})
 
 list(APPEND LIGHTREC_SOURCES
 	blockcache.c
+	constprop.c
 	emitter.c
 	interpreter.c
 	lightrec.c
@@ -38,6 +39,7 @@ list(APPEND LIGHTREC_SOURCES
 )
 list(APPEND LIGHTREC_HEADERS
 	blockcache.h
+	constprop.h
 	debug.h
 	disassembler.h
 	emitter.h
